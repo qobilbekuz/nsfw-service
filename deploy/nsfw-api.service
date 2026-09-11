@@ -1,0 +1,61 @@
+[Unit]
+Description=NSFW Detection API (FastAPI + ONNX)
+Documentation=https://api.qobilbek.dev/nsfw/docs
+After=network.target redis-server.service
+Wants=redis-server.service
+
+[Service]
+Type=exec
+User=www
+Group=www
+WorkingDirectory=/www/wwwroot/api.qobilbek.dev/nsfw-service
+
+# Eslatma: EnvironmentFile ATAYLAB ishlatilmaydi — systemd .env ni
+# pydantic-settings dan boshqacha parse qiladi va systemd qo'ygan qiymatlar
+# .env dan ustun turadi, ya'ni noto'g'ri parse jimgina g'olib chiqardi.
+# WorkingDirectory berilgani uchun pydantic-settings .env ni o'zi o'qiydi.
+# (stars-api.service da ham xuddi shu yondashuv.)
+
+# --forwarded-allow-ips: X-Forwarded-For ni faqat nginx (127.0.0.1) dan
+# qabul qilamiz, aks holda mijoz o'z IP'sini soxtalashtirib rate-limitni
+# chetlab o'tardi.
+ExecStart=/www/wwwroot/api.qobilbek.dev/nsfw-service/.venv/bin/uvicorn app.main:app \
+    --host 127.0.0.1 \
+    --port 8720 \
+    --workers 3 \
+    --proxy-headers \
+    --forwarded-allow-ips=127.0.0.1 \
+    --no-server-header \
+    --timeout-keep-alive 20 \
+    --root-path /nsfw
+
+Restart=always
+RestartSec=5
+KillSignal=SIGQUIT
+TimeoutStopSec=30
+
+# Har bir worker ikkita ONNX sessiyasini xotiraga yuklaydi (~35 MB model +
+# ORT arena). 3 worker uchun 2 GB yetarli, cheklov esa xotira sizishi
+# butun serverni yiqitishining oldini oladi.
+MemoryMax=2G
+
+# --- Xavfsizlik ---
+NoNewPrivileges=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectSystem=full
+ProtectHome=read-only
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+RestrictRealtime=true
+LockPersonality=true
+
+# --- Loglar: journald (journalctl -u nsfw-api -f) ---
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=nsfw-api
+
+[Install]
+WantedBy=multi-user.target

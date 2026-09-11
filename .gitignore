@@ -1,0 +1,12 @@
+.venv/
+models/*.onnx
+.env
+__pycache__/
+*.pyc
+.pytest_cache/
+.ruff_cache/
+
+# O'qitish artefaktlari (training/README.md)
+data/
+*.npz
+dataset.npz
