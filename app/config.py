@@ -67,6 +67,7 @@ class Settings(BaseSettings):
         default_factory=lambda: ["127.0.0.1", "::1"]
     )
     rate_limit_per_minute: int = 60
+    trusted_rate_limit_per_minute: int | None = None
 
     # --- Redis ---
     redis_url: str = "redis://127.0.0.1:6379/4"

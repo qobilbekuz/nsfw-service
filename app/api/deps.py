@@ -83,7 +83,12 @@ async def authenticate(request: Request) -> Principal:
         )
 
     if _is_trusted(ip):
-        return Principal(kind="trusted_ip", id=ip, rate_limit=_settings.rate_limit_per_minute)
+        trusted_limit = _settings.trusted_rate_limit_per_minute
+        return Principal(
+            kind="trusted_ip",
+            id=ip,
+            rate_limit=_settings.rate_limit_per_minute if trusted_limit is None else trusted_limit,
+        )
 
     if _settings.public_mode:
         return Principal(kind="public", id=ip, rate_limit=_settings.rate_limit_per_minute)
