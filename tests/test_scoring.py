@@ -75,8 +75,13 @@ def test_reasons_always_explain_decision() -> None:
     _v, _c, _s, reasons = scoring.evaluate(
         scores(20, 75, 5), [det("FACE_FEMALE", 85)]
     )
-    assert any("classifier" in r for r in reasons)
-    assert any("suggestive" in r for r in reasons)
+    codes = [code for code, _params in reasons]
+    assert "classifier_scores" in codes, "ballar ko'rsatilmadi"
+    assert "detector_top" in codes, "detektor topilmasi ko'rsatilmadi"
+    # Qarorning O'ZI ham sabablar orasida bo'lishi shart: bu yerda
+    # verdict `suggestive` — chunki oraliq zonada ochiq tana qismi
+    # topilmadi.
+    assert "nsfw_no_detection" in codes
 
 
 # ---------------------------------------------------------------------------
@@ -119,4 +124,4 @@ def test_needs_review_does_not_change_verdict() -> None:
     assert verdict is Verdict.SAFE
     assert scoring.is_nsfw(verdict) is False
     assert review is True
-    assert reason and "chegaraviy" in reason
+    assert reason is not None and reason[0].startswith("review_")

@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import hashlib
 import io
+import threading
 
 import numpy as np
 from PIL import Image, ImageOps, UnidentifiedImageError
@@ -34,6 +35,10 @@ _MAGIC: tuple[tuple[bytes, str], ...] = (
     (b"BM", "BMP"),
 )
 
+# Decoding a 50 MP image materialises ~150 MB before anything can shrink it.
+# The guard bounds how many of those can exist at once inside one worker.
+_decode_slots = threading.BoundedSemaphore(max(1, _settings.max_concurrent_decodes))
+
 
 def sniff_format(data: bytes) -> str | None:
     """Bayt imzosi bo'yicha formatni aniqlash (WEBP alohida — RIFF konteyneri)."""
@@ -60,8 +65,74 @@ def check_size(size_bytes: int) -> None:
         )
 
 
-def decode(data: bytes) -> tuple[Image.Image, ImageInfo]:
+def _work_size(width: int, height: int) -> tuple[int, int] | None:
+    """Target size that keeps the aspect ratio under `max_working_pixels`."""
+    budget = _settings.max_working_pixels
+    if budget <= 0 or width * height <= budget:
+        return None
+    factor = (budget / (width * height)) ** 0.5
+    return max(1, int(width * factor)), max(1, int(height * factor))
+
+
+def _decode_locked(data: bytes) -> tuple[Image.Image, str, int, int]:
+    img = Image.open(io.BytesIO(data))
+
+    # Piksel chegarasini O'ZIMIZ tekshiramiz. Pillow'ning o'z himoyasi
+    # MAX_IMAGE_PIXELS da faqat ogohlantirish beradi va xatoni ikki
+    # baravar chegaradan keyin ko'taradi — ya'ni 50 MP limit qo'yilgani
+    # bilan 99 MP rasm jimgina o'tib ketardi. `Image.open` lazy ishlaydi,
+    # shuning uchun `size` piksellarni ajratmasdan oldin ma'lum bo'ladi.
+    if img.width * img.height > _settings.max_image_pixels:
+        raise ApiError(
+            ErrorCode.IMAGE_TOO_LARGE_PIXELS,
+            "Rasm o'lchami juda katta (dekompressiya bombasi himoyasi)",
+            status_code=422,
+            details={
+                "pixels": img.width * img.height,
+                "max_pixels": _settings.max_image_pixels,
+            },
+        )
+
+    fmt = (img.format or sniff_format(data) or "UNKNOWN").upper()
+    if fmt not in ALLOWED_FORMATS:
+        raise ApiError(
+            ErrorCode.UNSUPPORTED_MEDIA_TYPE,
+            f"Format qo'llab-quvvatlanmaydi: {fmt}",
+            status_code=415,
+        )
+
+    full_width, full_height = img.width, img.height
+    target = _work_size(full_width, full_height)
+    # JPEG can be decoded straight at a reduced scale, so the full-size
+    # buffer is never allocated. Other formats must be decoded in full.
+    if target is not None:
+        img.draft("RGB", target)
+
+    # Pillow lazy ishlaydi — piksellarni shu yerda majburan o'qiymiz, shunda
+    # buzilgan fayl inference paytida emas, aynan shu yerda xato beradi.
+    img.load()
+    loaded = img.size
+    # EXIF orientatsiyasini qo'llaymiz: telefonda olingan rasmlar aks holda
+    # yonboshiga yotgan holda modelga tushadi.
+    img = ImageOps.exif_transpose(img) or img
+    if img.size == (loaded[1], loaded[0]) and loaded[0] != loaded[1]:
+        full_width, full_height = full_height, full_width
+    if img.mode != "RGB":
+        img = img.convert("RGB")
+    target = _work_size(img.width, img.height)
+    if target is not None:
+        img = img.resize(target, Image.Resampling.BILINEAR)
+    return img, fmt, full_width, full_height
+
+
+def decode(
+    data: bytes, sha256: str | None = None
+) -> tuple[Image.Image, ImageInfo, float]:
     """Baytlarni RGB rasmga aylantiradi va meta ma'lumot qaytaradi.
+
+    Uchinchi qiymat — ishchi rasmdan ASL o'lchamga o'tish koeffitsienti:
+    katta rasm modelga kichraytirib beriladi, lekin `ImageInfo` va
+    topilma ramkalari mijozga asl koordinatalarda ko'rsatiladi.
 
     Animatsiyali GIF/WEBP uchun faqat birinchi kadr olinadi.
     """
@@ -74,63 +145,37 @@ def decode(data: bytes) -> tuple[Image.Image, ImageInfo]:
             status_code=415,
         )
 
-    try:
-        img = Image.open(io.BytesIO(data))
-
-        # Piksel chegarasini O'ZIMIZ tekshiramiz. Pillow'ning o'z himoyasi
-        # MAX_IMAGE_PIXELS da faqat ogohlantirish beradi va xatoni ikki
-        # baravar chegaradan keyin ko'taradi — ya'ni 50 MP limit qo'yilgani
-        # bilan 99 MP rasm jimgina o'tib ketardi. `Image.open` lazy ishlaydi,
-        # shuning uchun `size` piksellarni ajratmasdan oldin ma'lum bo'ladi.
-        if img.width * img.height > _settings.max_image_pixels:
+    with _decode_slots:
+        try:
+            rgb, fmt, full_width, full_height = _decode_locked(data)
+        except ApiError:
+            raise
+        except Image.DecompressionBombError as exc:
             raise ApiError(
                 ErrorCode.IMAGE_TOO_LARGE_PIXELS,
                 "Rasm o'lchami juda katta (dekompressiya bombasi himoyasi)",
                 status_code=422,
-                details={
-                    "pixels": img.width * img.height,
-                    "max_pixels": _settings.max_image_pixels,
-                },
-            )
-
-        fmt = (img.format or sniff_format(data) or "UNKNOWN").upper()
-        if fmt not in ALLOWED_FORMATS:
+                details={"max_pixels": _settings.max_image_pixels},
+            ) from exc
+        except (UnidentifiedImageError, OSError, ValueError) as exc:
             raise ApiError(
-                ErrorCode.UNSUPPORTED_MEDIA_TYPE,
-                f"Format qo'llab-quvvatlanmaydi: {fmt}",
-                status_code=415,
-            )
-        # Pillow lazy ishlaydi — piksellarni shu yerda majburan o'qiymiz, shunda
-        # buzilgan fayl inference paytida emas, aynan shu yerda xato beradi.
-        img.load()
-        # EXIF orientatsiyasini qo'llaymiz: telefonda olingan rasmlar aks holda
-        # yonboshiga yotgan holda modelga tushadi.
-        img = ImageOps.exif_transpose(img) or img
-        rgb = img.convert("RGB")
-    except ApiError:
-        raise
-    except Image.DecompressionBombError as exc:
-        raise ApiError(
-            ErrorCode.IMAGE_TOO_LARGE_PIXELS,
-            "Rasm o'lchami juda katta (dekompressiya bombasi himoyasi)",
-            status_code=422,
-            details={"max_pixels": _settings.max_image_pixels},
-        ) from exc
-    except (UnidentifiedImageError, OSError, ValueError) as exc:
-        raise ApiError(
-            ErrorCode.DECODE_FAILED,
-            "Rasmni o'qib bo'lmadi — fayl buzilgan yoki rasm emas",
-            status_code=422,
-        ) from exc
+                ErrorCode.DECODE_FAILED,
+                "Rasmni o'qib bo'lmadi — fayl buzilgan yoki rasm emas",
+                status_code=422,
+            ) from exc
+
+    scale = (full_width / rgb.width) if rgb.width else 1.0
 
     info = ImageInfo(
-        width=rgb.width,
-        height=rgb.height,
+        width=full_width,
+        height=full_height,
         format=fmt,
         size_bytes=len(data),
-        sha256=hashlib.sha256(data).hexdigest(),
+        # Pipeline kesh kaliti uchun allaqachon hisoblagan — ikkinchi marta
+        # 20 MB ni xeshlash shart emas.
+        sha256=sha256 or hashlib.sha256(data).hexdigest(),
     )
-    return rgb, info
+    return rgb, info, scale
 
 
 def to_bgr_array(img: Image.Image) -> np.ndarray:

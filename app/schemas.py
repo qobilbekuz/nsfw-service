@@ -23,6 +23,11 @@ class Verdict(str, Enum):
 class AnalyzeOptions(BaseModel):
     """Barcha kirish rejimlarida umumiy ixtiyoriy parametrlar."""
 
+    # `extra="forbid"` shu YERDA bo'lishi shart: multipart rejimidagi
+    # `options` aynan shu modelga tekshiriladi, ya'ni `cache_enabled` yoki
+    # xato yozilgan `detekt` jimgina tushib qolardi va mijoz buni bilmasdi.
+    model_config = ConfigDict(extra="forbid")
+
     detect: bool = Field(
         default=True,
         description="Tana qismlarini aniqlovchi detektorni ishlatish (bbox bilan).",
@@ -105,6 +110,18 @@ class Detection(BaseModel):
     box: Box
 
 
+class Reason(BaseModel):
+    """Bitta sabab.
+
+    `code` — mashina uchun o'zgarmas, `params` — raqamlar, `messages`
+    esa tayyor matn (xato konvensiyasi bilan bir xil: `{en, uz, ru}`).
+    """
+
+    code: str
+    params: dict[str, Any] = Field(default_factory=dict)
+    messages: dict[str, str]
+
+
 class Scores(BaseModel):
     """Barcha ballar foizda (0.00-100.00), 2 kasr raqamgacha yaxlitlangan."""
 
@@ -144,7 +161,10 @@ class AnalyzeResult(BaseModel):
     confidence: float = Field(description="Chiqarilgan verdict ballining foizi.")
     scores: Scores
     detections: list[Detection] = Field(default_factory=list)
-    reasons: list[str] = Field(default_factory=list)
+    reasons: list[Reason] = Field(
+        default_factory=list,
+        description="Qarorning sabablari — kod, parametrlar va uch tildagi matn.",
+    )
     image: ImageInfo
     models: dict[str, str]
     timings_ms: Timings

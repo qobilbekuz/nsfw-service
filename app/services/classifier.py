@@ -11,6 +11,7 @@ ehtimolliklar. Bu yerda qo'shimcha normalize QILMASLIK kerak.
 from __future__ import annotations
 
 import logging
+import os
 from pathlib import Path
 
 import numpy as np
@@ -51,7 +52,16 @@ def ensure_feature_model(src: Path, dst: Path) -> Path:
             )
         )
     dst.parent.mkdir(parents=True, exist_ok=True)
-    onnx.save(model, str(dst))
+    # Uchta uvicorn worker `lifespan` ni BIR VAQTDA bajaradi. To'g'ridan
+    # to'g'ri yozish bir worker boshqasining yarim yozilgan faylini
+    # o'qishiga olib kelardi — `mtime` esa yangi bo'lgani uchun buzilgan
+    # nusxa keyin ham qabul qilinaverardi.
+    tmp = dst.with_name(f"{dst.name}.{os.getpid()}.tmp")
+    try:
+        onnx.save(model, str(tmp))
+        os.replace(tmp, dst)
+    finally:
+        tmp.unlink(missing_ok=True)
     log.info("embedding chiqishli model yaratildi: %s", dst.name)
     return dst
 

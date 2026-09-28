@@ -14,6 +14,8 @@ from app.config import get_settings
 from app.schemas import Detection, Scores, Verdict
 from app.services import detector as det
 
+Reason = tuple[str, dict[str, object]]
+
 _settings = get_settings()
 
 # Detektor topilmasi verdictni `nsfw` ga ko'tarishi uchun kerakli minimal
@@ -33,7 +35,7 @@ def evaluate(
     class_scores: dict[str, float],
     detections: list[Detection],
     detections_available: bool = True,
-) -> tuple[Verdict, float, Scores, list[str]]:
+) -> tuple[Verdict, float, Scores, list[Reason]]:
     """Yakuniy verdict, ishonch, ballar va sabablar ro'yxatini qaytaradi.
 
     `detections_available` — detektor umuman ishlatildimi. Bo'sh `detections`
@@ -59,10 +61,15 @@ def evaluate(
         nsfl=round(nsfl, 2),
     )
 
-    reasons: list[str] = [f"classifier: sfw {sfw:.2f}% / nsfw {nsfw:.2f}% / nsfl {nsfl:.2f}%"]
+    reasons: list[Reason] = [
+        ("classifier_scores",
+         {"sfw": round(sfw, 2), "nsfw": round(nsfw, 2), "nsfl": round(nsfl, 2)}),
+    ]
     if detections:
         top = detections[0]
-        reasons.append(f"detector: {top.label} {top.score:.2f}%")
+        reasons.append(
+            ("detector_top", {"label": top.label, "score": round(top.score, 2)})
+        )
         # Eng baland topilma ko'pincha `BELLY_EXPOSED` kabi *yumshoq* sinf
         # bo'ladi, qaror esa ochiq-oydin sinfga qarab chiqadi. Ikkalasi
         # boshqa-boshqa bo'lsa, qarorga asos bo'lganini ham ko'rsatamiz —
@@ -70,18 +77,26 @@ def evaluate(
         explicit = [d for d in detections if d.label in det.EXPLICIT_LABELS]
         if explicit and explicit[0].label != top.label:
             best = max(explicit, key=lambda d: d.score)
-            reasons.append(f"detector (ochiq-oydin): {best.label} {best.score:.2f}%")
+            reasons.append(
+                ("detector_explicit",
+                 {"label": best.label, "score": round(best.score, 2)})
+            )
 
     # --- Verdict (tartib muhim: eng og'iri birinchi tekshiriladi) ---
     if nsfl >= _settings.threshold_nsfl:
-        reasons.append(f"nsfl chegarasi oshdi ({nsfl:.2f}% >= {_settings.threshold_nsfl}%)")
+        reasons.append(
+            ("nsfl_threshold",
+             {"score": round(nsfl, 2), "threshold": _settings.threshold_nsfl})
+        )
         return Verdict.NSFL, round(nsfl, 2), scores, reasons
 
     if nsfw >= _settings.threshold_nsfw:
         # Klassifikator juda ishonchli — detektor tasdig'i shart emas.
         if nsfw >= _settings.threshold_nsfw_confident:
             reasons.append(
-                f"nsfw yuqori ishonch ({nsfw:.2f}% >= {_settings.threshold_nsfw_confident}%)"
+                ("nsfw_confident",
+                 {"score": round(nsfw, 2),
+                  "threshold": _settings.threshold_nsfw_confident})
             )
             return Verdict.NSFW, round(nsfw, 2), scores, reasons
 
@@ -92,16 +107,14 @@ def evaluate(
         # signal saqlanadi, lekin oddiy portret 18+ deb bloklanmaydi.
         if explicit_peak >= EXPLICIT_PROMOTE_SCORE:
             reasons.append(
-                f"nsfw oraliq zonasi ({nsfw:.2f}%) detektor bilan tasdiqlandi "
-                f"({explicit_peak:.2f}%)"
+                ("nsfw_confirmed",
+                 {"score": round(nsfw, 2), "peak": round(explicit_peak, 2)})
             )
             return Verdict.NSFW, round(nsfw, 2), scores, reasons
 
         if not detections_available:
             # Detektor o'chirilgan — tasdiqlab bo'lmaydi, chegaraga tayanamiz.
-            reasons.append(
-                f"nsfw chegarasi oshdi ({nsfw:.2f}%), detektor o'chirilgan"
-            )
+            reasons.append(("nsfw_no_detector", {"score": round(nsfw, 2)}))
             return Verdict.NSFW, round(nsfw, 2), scores, reasons
 
         # Ikki holatni ajratamiz: detektor hech narsa topmadi, yoki topdi-yu
@@ -109,28 +122,27 @@ def evaluate(
         # qo'lda ko'rib chiqishga arziydigan chegaraviy holat.
         if explicit_peak > 0:
             reasons.append(
-                f"nsfw oraliq zonasi ({nsfw:.2f}%); ochiq tana qismi topildi, "
-                f"lekin ishonchi past ({explicit_peak:.2f}% < "
-                f"{EXPLICIT_PROMOTE_SCORE:.0f}%) -> suggestive"
+                ("nsfw_weak_detection",
+                 {"score": round(nsfw, 2), "peak": round(explicit_peak, 2),
+                  "promote": round(EXPLICIT_PROMOTE_SCORE)})
             )
         else:
-            reasons.append(
-                f"nsfw oraliq zonasi ({nsfw:.2f}%), lekin detektor ochiq tana "
-                "qismini topmadi -> suggestive"
-            )
+            reasons.append(("nsfw_no_detection", {"score": round(nsfw, 2)}))
         return Verdict.SUGGESTIVE, round(nsfw, 2), scores, reasons
 
     if explicit_peak >= EXPLICIT_PROMOTE_SCORE:
         # Klassifikator ishonchsiz, lekin detektor ochiq tana qismini topdi —
         # moderatsiyada yolg'on salbiy yolg'on ijobiydan qimmatroq turadi.
-        reasons.append(f"detektorda ochiq tana qismi ({explicit_peak:.2f}%)")
+        reasons.append(
+            ("explicit_detection", {"peak": round(explicit_peak, 2)})
+        )
         return Verdict.NSFW, round(max(nsfw, explicit_peak), 2), scores, reasons
 
     if (
         suggestive >= _settings.threshold_suggestive
         or covered_peak >= SUGGESTIVE_PROMOTE_SCORE
     ):
-        reasons.append(f"shahvoniy ishora ({suggestive:.2f}%)")
+        reasons.append(("suggestive_hint", {"score": round(suggestive, 2)}))
         return Verdict.SUGGESTIVE, round(suggestive, 2), scores, reasons
 
     return Verdict.SAFE, round(sfw, 2), scores, reasons
@@ -150,7 +162,7 @@ def needs_review(
     verdict: Verdict,
     class_scores: dict[str, float],
     detections: list[Detection],
-) -> tuple[bool, str | None]:
+) -> tuple[bool, Reason | None]:
     """Natija qo'lda ko'rib chiqishga arziydimi?
 
     `is_safe` dan mustaqil: bu bayroq verdictni o'zgartirmaydi, faqat
@@ -164,25 +176,25 @@ def needs_review(
 
     # 1. `suggestive` — ta'rifiga ko'ra chegaraviy holat.
     if verdict is Verdict.SUGGESTIVE:
-        return True, "chegaraviy: suggestive"
+        return True, ("review_suggestive", {})
 
     # 2. `nsfw` oraliq zonada, ya'ni qaror detektor tasdig'iga tayangan.
     #    Detektor xato qilsa verdict ham xato — shuning uchun ko'rib chiqiladi.
     if verdict is Verdict.NSFW and nsfw < _settings.threshold_nsfw_confident:
-        return True, f"chegaraviy: nsfw oraliq zonada ({nsfw:.2f}%)"
+        return True, ("review_nsfw_middle", {"score": round(nsfw, 2)})
 
     # 3. `nsfl` chegaradan sal yuqorida.
     if verdict is Verdict.NSFL and nsfl < _settings.threshold_nsfl + REVIEW_MARGIN:
-        return True, f"chegaraviy: nsfl chegaraga yaqin ({nsfl:.2f}%)"
+        return True, ("review_nsfl_near", {"score": round(nsfl, 2)})
 
     # 4. `safe`, lekin oz farq bilan — kuchsiz ochiq-oydin topilma bor,
     #    yoki nsfw chegaraga yaqinlashgan.
     if verdict is Verdict.SAFE:
         if explicit_peak > 0:
             return True, (
-                f"chegaraviy: kuchsiz ochiq-oydin topilma ({explicit_peak:.2f}%)"
+                "review_weak_explicit", {"peak": round(explicit_peak, 2)}
             )
         if nsfw >= _settings.threshold_nsfw - REVIEW_MARGIN:
-            return True, f"chegaraviy: nsfw chegaraga yaqin ({nsfw:.2f}%)"
+            return True, ("review_nsfw_near", {"score": round(nsfw, 2)})
 
     return False, None

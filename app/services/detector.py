@@ -7,6 +7,8 @@ bo'ladi va `suggestive` (yopiq/yarim ochiq) darajasini ajratish mumkin.
 
 from __future__ import annotations
 
+import logging
+from importlib.metadata import PackageNotFoundError, version
 from pathlib import Path
 
 import nudenet
@@ -15,6 +17,14 @@ import onnxruntime as ort
 from nudenet import NudeDetector
 
 MODEL_NAME = "nudenet-320n"
+
+#: Kod NudeDetector'ning ICHKI atributlarini (`onnx_session`, `input_name`,
+#: `input_width`, `input_height`) to'g'ridan-to'g'ri o'rnatadi. Bu faqat shu
+#: versiyada tekshirilgan — boshqa versiyada logga ogohlantirish chiqadi.
+TESTED_NUDENET_VERSION = "3.4.2"
+_INPUT_RESOLUTION = 320
+
+log = logging.getLogger("nsfw.detector")
 
 # Ochiq-oydin 18+ ko'rsatkichlari — bittasi topilsa verdict `nsfw` bo'ladi.
 EXPLICIT_LABELS = frozenset(
@@ -44,24 +54,39 @@ SUGGESTIVE_LABELS = frozenset(
 
 class BodyPartDetector:
     def __init__(self, intra_threads: int = 2, inter_threads: int = 1) -> None:
-        self._detector = NudeDetector()
+        try:
+            installed = version("nudenet")
+        except PackageNotFoundError:
+            installed = "?"
+        if installed != TESTED_NUDENET_VERSION:
+            log.warning(
+                "nudenet %s o'rnatilgan, kod %s da sinalgan — ichki atributlar "
+                "o'zgargan bo'lishi mumkin (testlarni ishga tushiring)",
+                installed, TESTED_NUDENET_VERSION,
+            )
 
         # NudeNet o'z sessiyasini thread sozlamalarisiz yaratadi — u holda ORT
         # 20 yadroning hammasini egallaydi va 3 uvicorn worker bir-birini
-        # bo'g'adi. Sessiyani boshqariladigan variant bilan almashtiramiz.
+        # bo'g'adi. Shuning uchun sessiyani o'zimiz yaratamiz.
+        # `__new__` — konstruktorni chetlab o'tadi: ilgari `NudeDetector()`
+        # modelni BIR MARTA o'zi yuklardi, keyin biz uni almashtirardik, ya'ni
+        # har bir worker ishga tushishda modelni ikki marta yuklardi.
+        self._detector = NudeDetector.__new__(NudeDetector)
         options = ort.SessionOptions()
         options.intra_op_num_threads = intra_threads
         options.inter_op_num_threads = inter_threads
         options.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
         options.log_severity_level = 3
-        self.model_path = self._model_file()
+        self.model_path = self.model_file()
         self._detector.onnx_session = ort.InferenceSession(
             str(self.model_path), options, providers=["CPUExecutionProvider"]
         )
         self._detector.input_name = self._detector.onnx_session.get_inputs()[0].name
+        self._detector.input_width = _INPUT_RESOLUTION
+        self._detector.input_height = _INPUT_RESOLUTION
 
     @staticmethod
-    def _model_file() -> Path:
+    def model_file() -> Path:
         return Path(nudenet.__file__).parent / "320n.onnx"
 
     def detect(self, bgr: np.ndarray, min_score: float) -> list[dict[str, object]]:

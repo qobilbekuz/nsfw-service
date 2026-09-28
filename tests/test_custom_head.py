@@ -54,7 +54,7 @@ def test_feature_model_probabilities_identical(feature_model: Path, image_bytes)
     original = cm.SafetyClassifier(settings.classifier_path)
     with_features = cm.SafetyClassifier(feature_model)
 
-    img, _info = imaging.decode(image_bytes)
+    img, _info, _scale = imaging.decode(image_bytes)
     a = original.predict(img)
     b = with_features.predict(img)
     assert a == b
@@ -95,7 +95,7 @@ def test_custom_head_requires_feature_model(tmp_path: Path) -> None:
 
 def test_custom_head_changes_predictions(feature_model: Path, image_bytes) -> None:
     """Bosh haqiqatan ham ishlatilyaptimi (chetlab o'tilmayaptimi)."""
-    img, _info = imaging.decode(image_bytes)
+    img, _info, _scale = imaging.decode(image_bytes)
 
     # `nsfw` ni har doim ustun qiladigan sun'iy bosh.
     W = np.zeros((cm.EMBEDDING_DIM, len(cm.LABELS)), np.float32)

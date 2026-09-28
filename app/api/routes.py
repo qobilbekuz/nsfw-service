@@ -6,12 +6,12 @@ import asyncio
 import json
 import time
 
-from fastapi import APIRouter, Depends, File, Form, Request, UploadFile
+from fastapi import APIRouter, Depends, File, Form, Query, Request, UploadFile
 from fastapi.responses import JSONResponse
 
 from app.config import get_settings
 from app.core import imaging
-from app.envelope import ApiError, ErrorCode, error_body, success_response
+from app.envelope import MESSAGES, ApiError, ErrorCode, error_body, success_response
 from app.schemas import (
     AnalyzeRequest,
     BatchItem,
@@ -35,11 +35,16 @@ _secured = [Depends(api_key_scheme)]
 _STARTED_AT = time.time()
 
 
-async def _guard(request: Request) -> dict[str, str]:
-    """Auth + rate-limit. Javob sarlavhalarini qaytaradi."""
+async def _auth(request: Request):
     principal = await authenticate(request)
     request.state.principal = principal
-    return await enforce_rate_limit(request, principal)
+    return principal
+
+
+async def _guard(request: Request, cost: int = 1) -> dict[str, str]:
+    """Auth + rate-limit. Javob sarlavhalarini qaytaradi."""
+    principal = await _auth(request)
+    return await enforce_rate_limit(request, principal, cost=cost)
 
 
 def _with_headers(response: JSONResponse, headers: dict[str, str]) -> JSONResponse:
@@ -106,17 +111,23 @@ async def analyze(
 @router.get("/analyze", summary="URL bo'yicha tez tahlil (GET)", dependencies=_secured)
 async def analyze_get(
     request: Request,
-    url: str,
+    url: str = Query(max_length=4096),
     detect: bool = True,
-    min_detection_score: float = 25.0,
-    cache_enabled: bool = True,
+    # Chegara Query darajasida: ilgari BatchItem(...) handler ICHIDA
+    # tekshirilardi va `min_detection_score=500` 500 INTERNAL_ERROR berardi.
+    min_detection_score: float = Query(default=25.0, ge=0, le=100),
+    # POST tanasidagi nom bilan bir xil (`cache`). Eski `cache_enabled` nomi
+    # orqaga moslik uchun qabul qilinadi.
+    cache: bool | None = None,
+    cache_enabled: bool | None = Query(default=None, include_in_schema=False),
 ) -> JSONResponse:
     rl_headers = await _guard(request)
+    use_cache = cache if cache is not None else (cache_enabled if cache_enabled is not None else True)
     item = BatchItem(
         url=url,
         detect=detect,
         min_detection_score=min_detection_score,
-        cache=cache_enabled,
+        cache=use_cache,
     )
     result = await pipeline.analyze_item(item)
     return _with_headers(
@@ -130,7 +141,9 @@ async def analyze_get(
     dependencies=_secured,
 )
 async def analyze_batch(request: Request) -> JSONResponse:
-    rl_headers = await _guard(request)
+    # Avval faqat auth: limit narxi rasm soniga teng, u tanani o'qigandan
+    # keyingina ma'lum bo'ladi.
+    principal = await _auth(request)
     body = await _json_body(request)
     try:
         payload = BatchRequest.model_validate(body)
@@ -146,6 +159,10 @@ async def analyze_batch(request: Request) -> JSONResponse:
             status_code=400,
             details={"count": len(payload.items), "limit": _settings.max_batch_items},
         )
+
+    # Har bir rasm — alohida tahlil (va ehtimol alohida URL yuklash), shuning
+    # uchun limitdan rasm soniga teng birlik yechiladi.
+    rl_headers = await enforce_rate_limit(request, principal, cost=len(payload.items))
 
     semaphore = asyncio.Semaphore(_settings.batch_concurrency)
 
@@ -164,6 +181,7 @@ async def analyze_batch(request: Request) -> JSONResponse:
                     error={
                         "code": exc.code,
                         "message": exc.message,
+                        "messages": MESSAGES.get(exc.code, MESSAGES[ErrorCode.INVALID_REQUEST]),
                         "details": exc.details,
                     },
                 )
@@ -175,13 +193,26 @@ async def analyze_batch(request: Request) -> JSONResponse:
                     error={
                         "code": ErrorCode.INTERNAL_ERROR,
                         "message": "Ichki xato",
+                        "messages": MESSAGES[ErrorCode.INTERNAL_ERROR],
                         "details": None,
                     },
                 )
 
-    results = await asyncio.gather(
-        *(run(i, item) for i, item in enumerate(payload.items))
-    )
+    try:
+        # nginx mijozni 120 s da uzadi; muddatsiz `gather` esa hech kim
+        # o'qimaydigan javob uchun ishlashda davom etardi.
+        async with asyncio.timeout(_settings.batch_total_timeout):
+            results = await asyncio.gather(
+                *(run(i, item) for i, item in enumerate(payload.items))
+            )
+    except TimeoutError as exc:
+        raise ApiError(
+            ErrorCode.FETCH_TIMEOUT,
+            "Batch tahlili vaqti tugadi",
+            status_code=504,
+            details={"timeout_s": _settings.batch_total_timeout},
+            headers=rl_headers,
+        ) from exc
     succeeded = sum(1 for r in results if r.success)
     summary = BatchResult(
         count=len(results),
@@ -206,8 +237,10 @@ async def health(request: Request) -> JSONResponse:
         redis_state = "ok" if await cache.ping() else "down"
 
     models_loaded = pipeline.engine.ready
+    # Redis yo'qolsa rate-limit zaxira hisoblagichga tushadi va Redis'dagi
+    # kalitlar 401 bo'ladi. Bu YARIM uzilish — `status` uni ko'rsatishi shart.
     result = HealthResult(
-        status="ok" if models_loaded else "degraded",
+        status="ok" if models_loaded and redis_state != "down" else "degraded",
         version=_settings.version,
         models_loaded=models_loaded,
         redis=redis_state,

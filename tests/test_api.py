@@ -6,11 +6,15 @@ import base64
 
 from tests.conftest import make_image
 
-ENVELOPE_KEYS = {"success", "request_id", "took_ms", "data", "error"}
+# `ok` / `status_code` — PHP API'lar bilan bir xil maydonlar (2026-09-25).
+ENVELOPE_KEYS = {"success", "ok", "status_code", "request_id", "took_ms", "data", "error"}
 
 
 def assert_envelope(payload: dict) -> None:
     assert set(payload.keys()) == ENVELOPE_KEYS
+    assert payload["ok"] is payload["success"]
+    assert isinstance(payload["status_code"], int)
+    assert (payload["status_code"] == 200) is payload["success"]
     assert isinstance(payload["request_id"], str) and payload["request_id"]
     assert isinstance(payload["took_ms"], int)
     # `success` va `error` hech qachon birga to'ldirilmaydi.
@@ -18,7 +22,7 @@ def assert_envelope(payload: dict) -> None:
         assert payload["error"] is None and payload["data"] is not None
     else:
         assert payload["data"] is None and payload["error"] is not None
-        assert set(payload["error"].keys()) == {"code", "message", "details"}
+        assert set(payload["error"].keys()) == {"code", "message", "messages", "details"}
 
 
 # --------------------------------------------------------------------------

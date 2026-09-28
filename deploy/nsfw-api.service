@@ -26,12 +26,16 @@ ExecStart=/www/wwwroot/api.qobilbek.dev/nsfw-service/.venv/bin/uvicorn app.main:
     --proxy-headers \
     --forwarded-allow-ips=127.0.0.1 \
     --no-server-header \
+    --no-access-log \
     --timeout-keep-alive 20 \
     --root-path /nsfw
 
 Restart=always
 RestartSec=5
-KillSignal=SIGQUIT
+# SIGTERM — uvicorn faqat SIGINT/SIGTERM/SIGHUP ni ushlaydi. Ilgari SIGQUIT
+# edi: uvicorn uni ushlamaydi va jarayon DARHOL o'lardi (bajarilayotgan
+# so'rovlar uzilardi). SIGTERM'da ishlayotgan so'rovlar tugatib olinadi.
+KillSignal=SIGTERM
 TimeoutStopSec=30
 
 # Har bir worker ikkita ONNX sessiyasini xotiraga yuklaydi (~35 MB model +

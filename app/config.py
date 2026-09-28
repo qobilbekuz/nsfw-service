@@ -21,7 +21,7 @@ class Settings(BaseSettings):
 
     # --- Umumiy ---
     app_name: str = "NSFW Detection API"
-    version: str = "1.0.0"
+    version: str = "1.1.0"
     root_path: str = "/nsfw"
     debug: bool = False
 
@@ -43,8 +43,18 @@ class Settings(BaseSettings):
     # --- Kirish limitlari ---
     max_image_bytes: int = 20 * 1024 * 1024  # 20 MB
     max_image_pixels: int = 50_000_000  # dekompressiya bombasiga qarshi
+    # Klassifikator 224x224, detektor 320x320 ishlatadi — modelga 50 MP
+    # berishning ma'nosi yo'q, xotira esa piksellar soniga chiziqli o'sadi.
+    # 0 => kichraytirmaslik.
+    max_working_pixels: int = 4_000_000
+    # Bitta worker ichida bir vaqtda ochiladigan rasmlar soni.
+    max_concurrent_decodes: int = 2
     max_batch_items: int = 20
     batch_concurrency: int = 8
+    # Butun batch uchun muddat. nginx mijozni 120s da uzadi; undan keyin
+    # ishlashda davom etish faqat resurs isrofi.
+    batch_total_timeout: float = 110.0
+    item_total_timeout: float = 60.0
 
     # --- URL yuklash (SSRF) ---
     fetch_connect_timeout: float = 5.0
@@ -53,6 +63,11 @@ class Settings(BaseSettings):
     fetch_max_redirects: int = 3
     # Faqat sinov/ichki muhitda true qiling — privat IP'larga so'rovga ruxsat beradi.
     allow_private_targets: bool = False
+    # Butun xost bo'ylab bir vaqtda ochiq tashqi ulanishlar soni.
+    fetch_max_connections: int = 32
+    # Serverning O'Z manzillari avtomatik topiladi (`/proc/net`); bu yerga
+    # qo'shimcha tarmoqlarni vergul bilan yozish mumkin.
+    blocked_networks: Annotated[list[str], NoDecode] = Field(default_factory=list)
 
     # --- Path rejimi ---
     # Vergul bilan ajratilgan absolyut kataloglar. Bo'sh => path rejimi o'chiq.
@@ -68,9 +83,18 @@ class Settings(BaseSettings):
     )
     rate_limit_per_minute: int = 60
     trusted_rate_limit_per_minute: int | None = None
+    # Redis o'chsa yoki tozalansa ham ishlaydigan zaxira kalitlar (fail-closed
+    # auth barcha mijozlarni 401 qilib qo'ymasligi uchun). Format — vergul
+    # bilan: `id:sha256[:rate_limit]`. Kalitning O'ZI emas, faqat sha256
+    # dayjesti yoziladi (`scripts/apikey.py` Redis'da ham shunday saqlaydi).
+    bootstrap_keys: Annotated[list[str], NoDecode] = Field(default_factory=list)
 
     # --- Redis ---
     redis_url: str = "redis://127.0.0.1:6379/4"
+    # Ishga tushishda Redis yo'q bo'lsa, shuncha soniyada bir qayta ulanishga
+    # urinadi (ilgari ulanish faqat lifespan'da edi — bir marta muvaffaqiyatsiz
+    # bo'lsa servis restartgacha keshsiz va hamma kalitlar 401 bo'lib qolardi).
+    redis_retry_seconds: float = 5.0
     cache_enabled: bool = True
     cache_ttl_seconds: int = 7 * 24 * 3600
 
@@ -86,7 +110,10 @@ class Settings(BaseSettings):
     # Detektor topilmalari uchun minimal ishonch
     detection_min_score: float = 25.0
 
-    @field_validator("allowed_path_roots", "trusted_ips", mode="before")
+    @field_validator(
+        "allowed_path_roots", "trusted_ips", "bootstrap_keys", "blocked_networks",
+        mode="before",
+    )
     @classmethod
     def _split_csv(cls, v: object) -> object:
         """`.env` da vergul bilan yozilgan ro'yxatni qabul qilish.

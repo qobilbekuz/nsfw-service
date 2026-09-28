@@ -2,6 +2,7 @@ fastapi==0.141.1
 httpx==0.28.1
 nudenet==3.4.2
 numpy==2.5.2
+onnx==1.22.0
 onnxruntime==1.28.0
 opencv-python-headless==5.0.0.93
 pillow==12.3.0

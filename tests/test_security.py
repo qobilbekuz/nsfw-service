@@ -29,7 +29,7 @@ INTERNAL_IPS = [
     "2001:db8::1",
 ]
 
-PUBLIC_IPS = ["8.8.8.8", "1.1.1.1", "144.76.201.78", "2a00:1450:4001:80f::200e"]
+PUBLIC_IPS = ["8.8.8.8", "1.1.1.1", "2a00:1450:4001:80f::200e"]
 
 
 @pytest.mark.parametrize("ip", INTERNAL_IPS)
@@ -40,6 +40,16 @@ def test_internal_ips_rejected(ip: str) -> None:
 @pytest.mark.parametrize("ip", PUBLIC_IPS)
 def test_public_ips_allowed(ip: str) -> None:
     assert netguard.is_public(ip) is True
+
+
+def test_ozimizning_manzil_ham_bloklanadi() -> None:
+    """Serverning O'Z IP'si marshrutlanadigan, lekin u yerda faqat shu
+    xostga ochiq servislar turishi mumkin — `is_public` da "o'zim" tushunchasi
+    yo'q edi."""
+    if not netguard.OWN_ADDRESSES:
+        pytest.skip("/proc/net o'qilmadi")
+    for own in netguard.OWN_ADDRESSES:
+        assert netguard.is_public(own) is False
 
 
 def test_mixed_dns_result_rejected() -> None:

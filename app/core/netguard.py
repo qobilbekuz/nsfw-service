@@ -11,8 +11,15 @@ Shuning uchun DNS natijasidagi HAR BIR IP shu yerda tekshiriladi.
 from __future__ import annotations
 
 import ipaddress
+import logging
+import re
 import socket
 from typing import Iterable
+
+from app.config import get_settings
+
+log = logging.getLogger("nsfw.netguard")
+_settings = get_settings()
 
 # Python versiyalari orasida `is_private` ta'rifi o'zgargan (masalan 100.64.0.0/10
 # 3.12.4 dan keyin privat hisoblanmaydi). Shuning uchun muhim diapazonlarni
@@ -28,6 +35,52 @@ _EXTRA_BLOCKED = (
     ipaddress.ip_network("100::/64"),  # discard-only
     ipaddress.ip_network("2001:db8::/32"),  # hujjatlar uchun
 )
+
+
+_FIB_NODE = re.compile(r"\|--\s+(\d+\.\d+\.\d+\.\d+)")
+
+
+def _own_addresses() -> set[str]:
+    """The host's own addresses, so the API cannot be pointed back at us.
+
+    `is_public()` has no notion of "self": 144.76.201.78 is a routable
+    address, so a service bound to it and reachable only from the host
+    would otherwise be callable through this API.
+    """
+    found: set[str] = set()
+    try:
+        current = None
+        for line in open("/proc/net/fib_trie", encoding="utf-8", errors="replace"):
+            node = _FIB_NODE.search(line)
+            if node:
+                current = node.group(1)
+            elif current and "/32 host LOCAL" in line:
+                found.add(current)
+                current = None
+    except OSError as exc:
+        log.warning("o'z IPv4 manzillarini o'qib bo'lmadi: %s", exc)
+    try:
+        for line in open("/proc/net/if_inet6", encoding="utf-8", errors="replace"):
+            raw = line.split()
+            if raw:
+                found.add(str(ipaddress.IPv6Address(int(raw[0], 16))))
+    except (OSError, ValueError) as exc:
+        log.warning("o'z IPv6 manzillarini o'qib bo'lmadi: %s", exc)
+    return found
+
+
+def _blocked_networks() -> tuple:
+    nets = []
+    for entry in _settings.blocked_networks:
+        try:
+            nets.append(ipaddress.ip_network(entry, strict=False))
+        except ValueError:
+            log.warning("BLOCKED_NETWORKS yozuvi yaroqsiz: %r", entry)
+    return tuple(nets)
+
+
+OWN_ADDRESSES = _own_addresses()
+CONFIGURED_BLOCKED = _blocked_networks()
 
 
 def normalize(ip: ipaddress.IPv4Address | ipaddress.IPv6Address):
@@ -61,6 +114,10 @@ def is_public(raw: str) -> bool:
     ):
         return False
     if any(ip in net for net in _EXTRA_BLOCKED if net.version == ip.version):
+        return False
+    if str(ip) in OWN_ADDRESSES or raw in OWN_ADDRESSES:
+        return False
+    if any(ip in net for net in CONFIGURED_BLOCKED if net.version == ip.version):
         return False
     # IPv6 unique-local (fc00::/7) — `is_private` odatda qamrab oladi, lekin
     # aniqlik uchun takroran tekshiramiz.

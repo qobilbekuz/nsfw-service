@@ -32,6 +32,8 @@ Barcha javoblar — muvaffaqiyatli yoki xato — bir xil envelope'da qaytadi.
 ```json
 {
   "success": true,
+  "ok": true,
+  "status_code": 200,
   "request_id": "r_9ec19bd4d29b3bcee62b",
   "took_ms": 34,
   "data": { },
@@ -42,16 +44,24 @@ Barcha javoblar — muvaffaqiyatli yoki xato — bir xil envelope'da qaytadi.
 `success` va `error` hech qachon birga to'ldirilmaydi, shuning uchun mijozga
 faqat `success` ni tekshirish yetarli.
 
+`ok`, `status_code` va `error.messages` (2026-09-25) — api.qobilbek.dev dagi
+boshqa API'lar (tiktok, pinterest, likee ...) bilan bir xil maydonlar. Ular
+qo'shimcha: eski maydonlar o'zgarmagan. `ok` doim `success` ga teng,
+`status_code` — HTTP kodi.
+
 Xato holatida:
 ```json
 {
   "success": false,
+  "ok": false,
+  "status_code": 413,
   "request_id": "r_...",
   "took_ms": 3,
   "data": null,
   "error": {
     "code": "IMAGE_TOO_LARGE",
     "message": "Rasm hajmi 20 MB dan oshmasligi kerak",
+    "messages": {"uz": "Rasm hajmi juda katta.", "ru": "Изображение слишком большое.", "en": "Image is too large."},
     "details": { "size_bytes": 31457280, "limit_bytes": 20971520 }
   }
 }
@@ -102,14 +112,20 @@ curl -X POST https://api.qobilbek.dev/nsfw/v1/analyze \
 | Parametr | Turi | Default | Tavsif |
 |----------|------|---------|--------|
 | `detect` | bool | `true` | Tana qismlari detektorini ishlatish (bbox bilan) |
-| `min_detection_score` | float | `25.0` | Bundan past topilmalar javobga kirmaydi (%) |
+| `min_detection_score` | float (0–100) | `25.0` | Bundan past topilmalar **javobdagi `detections` ro'yxatiga** kirmaydi (%). **Verdictga ta'sir qilmaydi** — verdict doim serverning qat'iy chegarasi (`DETECTION_MIN_SCORE`, 25%) bo'yicha hisoblanadi |
 | `cache` | bool | `true` | sha256 bo'yicha natijani keshdan olish/keshga yozish |
+
+> 2026-09-25 gacha `min_detection_score` verdictga ham ta'sir qilardi: bir xil
+> rasm 25 da `nsfw`, 70 da `suggestive` chiqishi mumkin edi. Endi bu parametr
+> faqat ko'rinishni boshqaradi — moderatsiyani susaytira olmaydi.
 
 ### 3.6 GET varianti (tez sinov uchun)
 ```bash
 curl "https://api.qobilbek.dev/nsfw/v1/analyze?url=https://example.com/a.jpg&detect=true" \
   -H "X-API-Key: nsfw_..."
 ```
+GET parametrlari POST bilan bir xil nomda: `detect`, `min_detection_score`
+(0–100, aks holda 400), `cache`. Eski `cache_enabled` nomi ham qabul qilinadi.
 
 ---
 
@@ -270,6 +286,9 @@ birinchisini emas (`/v1/analyze/batch` shuning uchun bor).
 
 Bir so'rovda 20 tagacha rasm, 8 tasi bir vaqtda qayta ishlanadi.
 
+**Rate-limit:** batch rasm soniga teng birlik yeydi (20 ta rasm = 20 birlik).
+Limit yetmasa butun batch 429 bilan rad etiladi (`details.cost` da narxi).
+
 ```bash
 curl -X POST https://api.qobilbek.dev/nsfw/v1/analyze/batch \
   -H "X-API-Key: nsfw_..." \
@@ -288,7 +307,7 @@ Javob:
   "results": [
     {"id":"a","index":0,"success":true,"data":{ }},
     {"id":"c","index":2,"success":false,
-     "error":{"code":"PATH_NOT_ALLOWED","message":"...","details":null}}
+     "error":{"code":"PATH_NOT_ALLOWED","message":"...","messages":{"uz":"...","ru":"...","en":"..."},"details":null}}
   ]
 }
 ```
@@ -336,7 +355,7 @@ Yuklangan modellar, limitlar va joriy chegaralarni qaytaradi.
 | Sarlavha | Yo'nalish | Tavsif |
 |----------|-----------|--------|
 | `X-API-Key` | so'rov | Autentifikatsiya |
-| `X-Request-ID` | ikkala | Mijoz bersa saqlanadi, aks holda generatsiya qilinadi |
+| `X-Request-ID` | ikkala | Mijoz bersa (`[A-Za-z0-9._:-]`, 64 belgigacha) saqlanadi, aks holda generatsiya qilinadi |
 | `X-RateLimit-Limit` | javob | Daqiqadagi limit |
 | `X-RateLimit-Remaining` | javob | Qolgan so'rovlar |
 | `X-RateLimit-Reset` | javob | Oyna necha soniyada yangilanadi |
@@ -354,8 +373,8 @@ Yuklangan modellar, limitlar va joriy chegaralarni qaytaradi.
 | Batch elementlari | 20 |
 | URL yuklash timeouti | 15 s (connect 5 s, read 10 s) |
 | Redirect'lar | 3 tagacha, har biri qayta tekshiriladi |
-| Standart rate-limit | 60 so'rov/daqiqa (kalitga qarab sozlanadi) |
-| Natija keshi | 7 kun (sha256 bo'yicha) |
+| Standart rate-limit | 60 rasm/daqiqa (kalitga qarab sozlanadi; batch = rasm soni) |
+| Natija keshi | 7 kun (sha256 + model/chegaralar versiyasi bo'yicha — qayta kalibrlashdan keyin eski natija qaytmaydi) |
 
 ---
 

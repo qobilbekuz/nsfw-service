@@ -7,16 +7,19 @@ Ishga tushirish (systemd orqali):
 from __future__ import annotations
 
 import logging
+import re
 import time
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
+from pydantic import ValidationError
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
 from app.api.routes import router
 from app.config import get_settings
+from app.core import fetcher
 from app.envelope import ApiError, ErrorCode, error_response, new_request_id
 from app.services import pipeline
 from app.services.cache import cache
@@ -32,36 +35,58 @@ logging.basicConfig(
 )
 log = logging.getLogger("nsfw")
 
+# httpx har bir so'rovni INFO da loglaydi — ya'ni tahlil qilingan HAR BIR
+# rasmning to'liq manzili journal'ga tushardi. Bu moderatsiya servisi:
+# loglar 18+ havolalar to'plamiga aylanmasligi kerak (audit 2026-09-25).
+logging.getLogger("httpx").setLevel(logging.WARNING)
+logging.getLogger("httpcore").setLevel(logging.WARNING)
+
+#: Mijoz bergan X-Request-ID faqat shu shaklda qabul qilinadi; aks holda
+#: yangisi yaratiladi (ilgari 3000 baytlik qiymat ham log va javobga ketardi).
+_REQUEST_ID_RE = re.compile(r"^[A-Za-z0-9._:-]{1,64}$")
+
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Modellarni bir marta yuklaydi — har so'rovda emas."""
     started = time.perf_counter()
 
-    model_path, head = settings.classifier_path, None
+    def build(model_path, head):
+        return SafetyClassifier(
+            model_path,
+            intra_threads=settings.onnx_intra_threads,
+            inter_threads=settings.onnx_inter_threads,
+            custom_head=head,
+        )
+
+    model_path, head, classifier = settings.classifier_path, None, None
     if settings.custom_head_path:
         # Nosozlik bo'lsa servisni tushirmaymiz — asl boshga qaytamiz.
         # Moderatsiya butunlay to'xtagandan ko'ra, biroz aniqroq bo'lmagan
         # model bilan ishlagan afzal. Log ogohlantiradi, `/v1/models` esa
-        # qaysi bosh ishlayotganini ko'rsatadi.
+        # qaysi bosh ishlayotganini ko'rsatadi. Sessiyani QURISH ham shu
+        # `try` ichida: buzilgan nusxa aynan shu yerda xato berardi va
+        # servis `Restart=always` bilan aylanib qolardi.
         try:
             head = classifier_mod.load_custom_head(settings.custom_head_path)
             model_path = classifier_mod.ensure_feature_model(
                 settings.classifier_path, settings.feature_model_path
             )
+            classifier = build(model_path, head)
         except Exception:
             log.exception(
                 "o'z boshingizni yuklab bo'lmadi (%s) — asl bosh ishlatiladi",
                 settings.custom_head_file,
             )
-            model_path, head = settings.classifier_path, None
+            model_path, head, classifier = settings.classifier_path, None, None
 
-    pipeline.engine.classifier = SafetyClassifier(
+    pipeline.engine.fingerprint = pipeline.compute_fingerprint(
         model_path,
-        intra_threads=settings.onnx_intra_threads,
-        inter_threads=settings.onnx_inter_threads,
-        custom_head=head,
+        settings.custom_head_path if head is not None else None,
+        BodyPartDetector.model_file() if settings.detector_enabled else None,
     )
+
+    pipeline.engine.classifier = classifier or build(model_path, head)
     if settings.detector_enabled:
         pipeline.engine.detector = BodyPartDetector(
             intra_threads=settings.onnx_intra_threads,
@@ -70,13 +95,15 @@ async def lifespan(app: FastAPI):
 
     await cache.connect()
     log.info(
-        "modellar yuklandi (%.0f ms), redis=%s",
+        "modellar yuklandi (%.0f ms), redis=%s, fingerprint=%s",
         (time.perf_counter() - started) * 1000,
         "ok" if cache.available else "yo'q",
+        pipeline.engine.fingerprint,
     )
     try:
         yield
     finally:
+        await fetcher.aclose()
         await cache.close()
 
 
@@ -99,7 +126,10 @@ app = FastAPI(
 async def request_context(request: Request, call_next):
     """Har bir so'rovga `request_id` va vaqt hisoblagichini biriktiradi."""
     request.state.started_at = time.perf_counter()
-    request.state.request_id = request.headers.get("x-request-id") or new_request_id()
+    incoming_id = request.headers.get("x-request-id") or ""
+    request.state.request_id = (
+        incoming_id if _REQUEST_ID_RE.match(incoming_id) else new_request_id()
+    )
 
     try:
         response = await call_next(request)
@@ -115,15 +145,22 @@ async def request_context(request: Request, call_next):
     response.headers["X-Request-ID"] = request.state.request_id
     took_ms = int((time.perf_counter() - request.state.started_at) * 1000)
 
-    if request.url.path.startswith("/v1/") and not request.url.path.endswith("/health"):
+    # `request.url.path` root_path'ni ham o'z ichiga oladi (`/nsfw/v1/...`) —
+    # ilgari shart `startswith("/v1/")` edi va bu audit qatori HECH QACHON
+    # yozilmasdi. Endi uvicorn access log'i o'chirilgan (`--no-access-log`,
+    # u `?url=...` ni to'liq yozardi), shuning uchun bu yagona so'rov logi.
+    path = request.url.path
+    if settings.root_path and path.startswith(settings.root_path):
+        path = path[len(settings.root_path):] or "/"
+    if path.startswith("/v1/") and not path.endswith("/health"):
         principal = getattr(request.state, "principal", None)
-        # DIQQAT: URL, fayl yo'li va rasm mazmuni ATAYLAB loglanmaydi —
+        # DIQQAT: URL, query, fayl yo'li va rasm mazmuni ATAYLAB loglanmaydi —
         # bu moderatsiya servisi, loglar maxfiy ma'lumot to'plamiga
         # aylanmasligi kerak.
         log.info(
             "%s %s status=%s took_ms=%s key=%s rid=%s",
             request.method,
-            request.url.path,
+            path,
             response.status_code,
             took_ms,
             f"{principal.kind}:{principal.id}" if principal else "-",
@@ -159,6 +196,25 @@ async def handle_validation_error(
     )
 
 
+@app.exception_handler(ValidationError)
+async def handle_pydantic_error(request: Request, exc: ValidationError) -> JSONResponse:
+    """Handler ichida yasalgan model (masalan `BatchItem(...)`) xatosi.
+
+    FastAPI faqat kirish parametrlaridagi xatoni `RequestValidationError` ga
+    aylantiradi; handler ichidagi `ValidationError` ilgari ushlanmay 500
+    INTERNAL_ERROR bo'lib chiqardi.
+    """
+    first = exc.errors()[0] if exc.errors() else {}
+    location = ".".join(str(p) for p in first.get("loc", ()))
+    message = first.get("msg", "so'rov formati noto'g'ri")
+    return error_response(
+        request,
+        ErrorCode.INVALID_REQUEST,
+        f"{location}: {message}" if location else message,
+        status_code=400,
+    )
+
+
 @app.exception_handler(StarletteHTTPException)
 async def handle_http_error(
     request: Request, exc: StarletteHTTPException
@@ -166,8 +222,8 @@ async def handle_http_error(
     """404/405 kabi framework xatolarini ham bir xil envelope'ga soladi."""
     code = {
         401: ErrorCode.UNAUTHORIZED,
-        404: "NOT_FOUND",
-        405: "METHOD_NOT_ALLOWED",
+        404: ErrorCode.NOT_FOUND,
+        405: ErrorCode.METHOD_NOT_ALLOWED,
         413: ErrorCode.IMAGE_TOO_LARGE,
         415: ErrorCode.UNSUPPORTED_MEDIA_TYPE,
     }.get(exc.status_code, ErrorCode.INVALID_REQUEST if exc.status_code < 500 else ErrorCode.INTERNAL_ERROR)
