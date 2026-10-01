@@ -26,7 +26,7 @@ from app.envelope import ApiError, ErrorCode
 
 _settings = get_settings()
 
-_USER_AGENT = f"nsfw-api/{_settings.version} (+https://api.qobilbek.dev/nsfw/)"
+_USER_AGENT = "Mozilla/5.0 (compatible; media-fetcher/1.0)"
 
 
 def _forbidden(url: str, reason: str) -> ApiError:

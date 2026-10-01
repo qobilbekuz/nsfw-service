@@ -191,3 +191,11 @@ def test_decompression_bomb_rejected() -> None:
     with pytest.raises(ApiError) as exc:
         imaging.decode(data)
     assert exc.value.code == "IMAGE_TOO_LARGE_PIXELS"
+
+
+def test_outbound_user_agent_is_neutral() -> None:
+    from app.core import fetcher
+
+    _url, headers, _ext = fetcher._prepare("http://93.184.216.34/a.jpg")
+    agent = headers["User-Agent"].lower()
+    assert "qobilbek" not in agent and "nsfw" not in agent and "http" not in agent
