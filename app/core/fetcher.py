@@ -67,6 +67,8 @@ def _prepare(url: str) -> tuple[httpx.URL, dict[str, str], dict[str, str]]:
         )
 
     port = explicit_port or (443 if scheme == "https" else 80)
+    if port not in _settings.fetch_allowed_ports:
+        raise _forbidden(url, f"port {port}")
 
     try:
         candidates = netguard.resolve_all(host, port)

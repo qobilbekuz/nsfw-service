@@ -61,6 +61,7 @@ class Settings(BaseSettings):
     fetch_read_timeout: float = 10.0
     fetch_total_timeout: float = 15.0
     fetch_max_redirects: int = 3
+    fetch_allowed_ports: Annotated[list[int], NoDecode] = Field(default_factory=lambda: [80, 443])
     # Faqat sinov/ichki muhitda true qiling — privat IP'larga so'rovga ruxsat beradi.
     allow_private_targets: bool = False
     # Butun xost bo'ylab bir vaqtda ochiq tashqi ulanishlar soni.
@@ -112,6 +113,7 @@ class Settings(BaseSettings):
 
     @field_validator(
         "allowed_path_roots", "trusted_ips", "bootstrap_keys", "blocked_networks",
+        "fetch_allowed_ports",
         mode="before",
     )
     @classmethod

@@ -199,3 +199,45 @@ def test_outbound_user_agent_is_neutral() -> None:
     _url, headers, _ext = fetcher._prepare("http://93.184.216.34/a.jpg")
     agent = headers["User-Agent"].lower()
     assert "qobilbek" not in agent and "nsfw" not in agent and "http" not in agent
+
+
+def test_only_web_ports_are_fetched() -> None:
+    import pytest
+
+    from app.core import fetcher
+    from app.envelope import ApiError
+
+    for url in ("http://93.184.216.34:22/a.jpg", "https://93.184.216.34:6379/a.jpg",
+                "http://93.184.216.34:8080/a.jpg"):
+        with pytest.raises(ApiError) as caught:
+            fetcher._prepare(url)
+        assert caught.value.status_code == 403
+    for url in ("http://93.184.216.34/a.jpg", "https://93.184.216.34:443/a.jpg"):
+        fetcher._prepare(url)
+
+
+def test_a_redirect_to_another_port_is_refused(monkeypatch) -> None:
+    import asyncio
+
+    import httpx
+    import pytest
+
+    from app.core import fetcher
+    from app.envelope import ApiError
+
+    class Client:
+        async def send(self, request: httpx.Request, **kwargs: object) -> httpx.Response:
+            return httpx.Response(
+                302, headers={"location": "http://93.184.216.34:22/x"}, request=request
+            )
+
+        def build_request(self, method: str, url: object, **kwargs: object) -> httpx.Request:
+            return httpx.Request(method, url, headers=kwargs.get("headers"))
+
+    async def client() -> Client:
+        return Client()
+
+    monkeypatch.setattr(fetcher, "get_client", client)
+    with pytest.raises(ApiError) as caught:
+        asyncio.run(fetcher._fetch("http://93.184.216.34/a.jpg"))
+    assert caught.value.status_code == 403
